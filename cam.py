@@ -66,13 +66,8 @@ class StreamBuffer:
         
     def put(self, frame):
         with self.lock:
-            if len(self.queue) >= self.queue.maxlen - 1:
-                # If buffer is almost full, drop the oldest frame
-                try:
-                    self.queue.popleft()
-                except IndexError:
-                    pass
             self.queue.append(frame)
+            
     def get(self):
         with self.lock:
             return self.queue.popleft() if self.queue else None
@@ -87,8 +82,6 @@ class TwitchStreamer(threading.Thread):
         self.buffer = StreamBuffer()
         self.running = True
         self.process = None
-        self.frame_time = 1.0 / fps  # Time per frame
-        self.last_frame_time = time.time()
         
     def run(self):
         command = [
@@ -103,29 +96,20 @@ class TwitchStreamer(threading.Thread):
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-x264-params', 'keyint=30:min-keyint=30',  # Force keyframe interval
-            '-maxrate', '1500k',  # Limit bitrate
-            '-bufsize', '500k',   # Smaller buffer size
             '-pix_fmt', 'yuv420p',
             '-f', 'flv',
             '-flvflags', 'no_duration_filesize',
+            '-bufsize', '512k',
             self.stream_url
         ]
         
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
         
         while self.running:
-            current_time = time.time()
             frame = self.buffer.get()
-            
             if frame is not None:
-                # Check if we need to skip this frame to maintain timing
-                if current_time - self.last_frame_time < self.frame_time:
-                    continue
-                    
                 try:
                     self.process.stdin.write(frame.tobytes())
-                    self.last_frame_time = current_time
                 except (IOError, BrokenPipeError):
                     break
                     
@@ -277,38 +261,31 @@ def main(args):
     fps_tracker = deque(maxlen=30)
     last_time = time.time()
     
-    frame_interval = 1.0 / args.fps
-    last_frame_time = time.time()
-    
     try:
         while True:
             frame_start = time.time()
-            elapsed = frame_start - last_frame_time
             
-            # Skip frame if we're falling behind
-            if elapsed < frame_interval:
-                continue
-                
             metadata = picam2.capture_metadata()
             frame = picam2.capture_array()
             
-            # Only process if we're not too far behind
-            if elapsed < frame_interval * 2:
+            # Process detections only every other frame
+            if streamer.buffer.queue.maxlen > len(streamer.buffer.queue):
                 detections = parse_detections(metadata)
                 if detections:
                     detection_stats.update(detections, labels)
                     frame = draw_detections(frame, detections, labels)
-                
+            
                 # Calculate FPS
                 current_time = time.time()
                 fps_tracker.append(1 / (current_time - frame_start))
                 fps = sum(fps_tracker) / len(fps_tracker)
                 
+                # Update overlay
                 stats = detection_stats.get_stats(labels)
                 frame = draw_overlay(frame, stats, fps)
             
+            # Send frame to streamer
             streamer.send_frame(frame)
-            last_frame_time = current_time
             
     except KeyboardInterrupt:
         print("\nShutting down...")

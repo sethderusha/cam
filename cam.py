@@ -66,8 +66,13 @@ class StreamBuffer:
         
     def put(self, frame):
         with self.lock:
+            if len(self.queue) >= self.queue.maxlen - 1:
+                # If buffer is almost full, drop the oldest frame
+                try:
+                    self.queue.popleft()
+                except IndexError:
+                    pass
             self.queue.append(frame)
-            
     def get(self):
         with self.lock:
             return self.queue.popleft() if self.queue else None
@@ -82,6 +87,8 @@ class TwitchStreamer(threading.Thread):
         self.buffer = StreamBuffer()
         self.running = True
         self.process = None
+        self.frame_time = 1.0 / fps  # Time per frame
+        self.last_frame_time = time.time()
         
     def run(self):
         command = [
@@ -96,20 +103,29 @@ class TwitchStreamer(threading.Thread):
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
+            '-x264-params', 'keyint=30:min-keyint=30',  # Force keyframe interval
+            '-maxrate', '1500k',  # Limit bitrate
+            '-bufsize', '500k',   # Smaller buffer size
             '-pix_fmt', 'yuv420p',
             '-f', 'flv',
             '-flvflags', 'no_duration_filesize',
-            '-bufsize', '512k',
             self.stream_url
         ]
         
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
         
         while self.running:
+            current_time = time.time()
             frame = self.buffer.get()
+            
             if frame is not None:
+                # Check if we need to skip this frame to maintain timing
+                if current_time - self.last_frame_time < self.frame_time:
+                    continue
+                    
                 try:
                     self.process.stdin.write(frame.tobytes())
+                    self.last_frame_time = current_time
                 except (IOError, BrokenPipeError):
                     break
                     
@@ -136,29 +152,110 @@ class Detection:
         self.conf = conf
         self.box = imx500.convert_inference_coords(coords, metadata, picam2)
 
+def scale_boxes(boxes, r_w, r_h, input_h, input_w, swap=False, normalized=False):
+    """Scale boxes to image size."""
+    boxes = np.array(boxes).reshape(-1, 4)
+    
+    if normalized:
+        boxes *= np.array([input_w, input_h, input_w, input_h])
+    
+    boxes = boxes.reshape(-1, 4)
+    scale = np.array([r_w, r_h, r_w, r_h])
+    if swap:
+        boxes = boxes[:, [1, 0, 3, 2]] * scale
+    else:
+        boxes = boxes * scale
+    return boxes
+
 @lru_cache(maxsize=32)
 def get_labels():
     labels = intrinsics.labels
     return [label for label in labels if label and label != "-"] if intrinsics.ignore_dash_labels else labels
 
+def parse_detections(metadata: dict):
+    """Parse the output tensor into detections with optimizations."""
+    bbox_normalization = intrinsics.bbox_normalization
+    bbox_order = intrinsics.bbox_order
+    threshold = args.threshold
+    iou = args.iou
+    max_detections = args.max_detections
+
+    np_outputs = imx500.get_outputs(metadata, add_batch=True)
+    if np_outputs is None:
+        return None
+        
+    input_w, input_h = imx500.get_input_size()
+    
+    try:
+        if intrinsics.postprocess == "nanodet":
+            boxes, scores, classes = \
+                postprocess_nanodet_detection(
+                    outputs=np_outputs[0], 
+                    conf=threshold, 
+                    iou_thres=iou,
+                    max_out_dets=max_detections
+                )[0]
+            boxes = scale_boxes(boxes, 1, 1, input_h, input_w, False, False)
+        else:
+            boxes = np_outputs[0][0]
+            scores = np_outputs[1][0]
+            classes = np_outputs[2][0]
+            
+            if bbox_normalization:
+                np.divide(boxes, input_h, out=boxes)
+
+            if bbox_order == "xy":
+                boxes = boxes[:, [1, 0, 3, 2]]
+            
+            boxes = np.array_split(boxes, 4, axis=1)
+            boxes = zip(*boxes)
+
+        return [
+            Detection(box, category, score, metadata)
+            for box, score, category in zip(boxes, scores, classes)
+            if score > threshold
+        ][:max_detections]
+        
+    except Exception as e:
+        print(f"Error processing detections: {e}")
+        return None
+
+def draw_detections(frame, detections, labels):
+    """Draw detections onto the frame with optimized rendering."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    
+    for detection in detections:
+        x, y, w, h = detection.box
+        label = f"{labels[int(detection.category)]} ({detection.conf:.2f})"
+        
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+        cv2.rectangle(frame, (x, y - text_h - 4), (x + text_w, y), (0, 255, 0), -1)
+        cv2.putText(frame, label, (x, y - 4), font, font_scale, (0, 0, 0), font_thickness)
+    
+    return frame
+
 def draw_overlay(frame, stats, fps):
-    # Create overlay only when needed
+    """Draw overlay with stats and FPS counter."""
     if stats:
-        height, width = frame.shape[:2]
-        overlay = np.zeros((height, width, 3), dtype=np.uint8)
+        # Draw semi-transparent black background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (200, 90), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
         
-        # Simplified stats display
-        cv2.putText(overlay, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Draw text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        y = 30
+        cv2.putText(frame, f"FPS: {fps:.1f}", (15, y), font, 0.5, (255, 255, 255), 1)
+        y += 20
         
-        y = 50
         for key, value in stats.items():
             if key in ['average_detections', 'average_confidence', 'detection_rate']:
-                cv2.putText(overlay, f"{key}: {value}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"{key}: {value}", (15, y), font, 0.5, (255, 255, 255), 1)
                 y += 20
-        
-        # Blend overlay
-        mask = overlay > 0
-        frame[mask] = cv2.addWeighted(frame[mask], 0.5, overlay[mask], 0.5, 0)
     
     return frame
 
@@ -168,7 +265,6 @@ def main(args):
     detection_stats = DetectionStats()
     labels = get_labels()
     
-    # Initialize and start streamer in separate thread
     streamer = TwitchStreamer(
         args.rtmp_url,
         args.stream_key,
@@ -181,31 +277,38 @@ def main(args):
     fps_tracker = deque(maxlen=30)
     last_time = time.time()
     
+    frame_interval = 1.0 / args.fps
+    last_frame_time = time.time()
+    
     try:
         while True:
             frame_start = time.time()
+            elapsed = frame_start - last_frame_time
             
+            # Skip frame if we're falling behind
+            if elapsed < frame_interval:
+                continue
+                
             metadata = picam2.capture_metadata()
             frame = picam2.capture_array()
             
-            # Process detections only every other frame
-            if streamer.buffer.queue.maxlen > len(streamer.buffer.queue):
+            # Only process if we're not too far behind
+            if elapsed < frame_interval * 2:
                 detections = parse_detections(metadata)
                 if detections:
                     detection_stats.update(detections, labels)
                     frame = draw_detections(frame, detections, labels)
-            
+                
                 # Calculate FPS
                 current_time = time.time()
                 fps_tracker.append(1 / (current_time - frame_start))
                 fps = sum(fps_tracker) / len(fps_tracker)
                 
-                # Update overlay
                 stats = detection_stats.get_stats(labels)
                 frame = draw_overlay(frame, stats, fps)
             
-            # Send frame to streamer
             streamer.send_frame(frame)
+            last_frame_time = current_time
             
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -218,7 +321,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str,
                         default="/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk")
-    parser.add_argument("--threshold", type=float, default=0.6)
+    parser.add_argument("--threshold", type=float, default=0.4)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--max-detections", type=int, default=5)
     parser.add_argument("--rtmp-url", type=str, required=True)

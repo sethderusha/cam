@@ -13,7 +13,7 @@ from picamera2.devices import IMX500
 from picamera2.devices.imx500 import (NetworkIntrinsics, postprocess_nanodet_detection)
 
 class DetectionStats:
-    def __init__(self, window_size=30):  # Reduced window size
+    def __init__(self, window_size=30):
         self.window_size = window_size
         self.recent_detections = deque(maxlen=window_size)
         self.confidence_history = deque(maxlen=window_size)
@@ -21,7 +21,7 @@ class DetectionStats:
         self.total_frames = 0
         self.frames_with_detections = 0
         self.lock = threading.Lock()
-        self.detection_history = deque(maxlen=5)  # Reduced history size
+        self.detection_history = deque(maxlen=5)
         
     def update(self, detections, labels):
         with self.lock:
@@ -225,12 +225,11 @@ def draw_detections(frame, detections, labels):
 def draw_overlay(frame, stats, fps):
     """Draw overlay with stats and FPS counter."""
     if stats:
-        # Draw semi-transparent black background
+        
         overlay = frame.copy()
         cv2.rectangle(overlay, (10, 10), (200, 90), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
         
-        # Draw text
         font = cv2.FONT_HERSHEY_SIMPLEX
         y = 30
         cv2.putText(frame, f"FPS: {fps:.1f}", (15, y), font, 0.5, (255, 255, 255), 1)
@@ -268,23 +267,19 @@ def main(args):
             metadata = picam2.capture_metadata()
             frame = picam2.capture_array()
             
-            # Process detections only every other frame
             if streamer.buffer.queue.maxlen > len(streamer.buffer.queue):
                 detections = parse_detections(metadata)
                 if detections:
                     detection_stats.update(detections, labels)
                     frame = draw_detections(frame, detections, labels)
             
-                # Calculate FPS
                 current_time = time.time()
                 fps_tracker.append(1 / (current_time - frame_start))
                 fps = sum(fps_tracker) / len(fps_tracker)
                 
-                # Update overlay
                 stats = detection_stats.get_stats(labels)
                 frame = draw_overlay(frame, stats, fps)
             
-            # Send frame to streamer
             streamer.send_frame(frame)
             
     except KeyboardInterrupt:
@@ -309,7 +304,6 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    # Initialize camera with optimized settings
     imx500 = IMX500(args.model)
     intrinsics = imx500.network_intrinsics or NetworkIntrinsics()
     if not intrinsics.task:
@@ -319,7 +313,7 @@ if __name__ == "__main__":
     config = picam2.create_preview_configuration(
         main={"format": "RGB888", "size": (args.width, args.height)},
         controls={"FrameRate": args.fps},
-        buffer_count=4  # Reduced buffer count
+        buffer_count=4
     )
     
     picam2.start(config)
